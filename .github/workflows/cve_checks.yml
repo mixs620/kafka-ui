@@ -6,22 +6,6 @@ on:
   push:
     branches: [ "main" ]
   workflow_dispatch:
-    inputs:
-      scan-target:
-        description: 'Target to scan (tag/branch)'
-        required: true
-        default: 'main'
-        type: choice
-        options:
-          - main
-          - 1.4.2
-          - 1.5.0
-          - custom
-      custom-ref:
-        description: 'Custom ref (branch/tag/commit) - используется только если выбрано "custom"'
-        required: false
-        default: ''
-        type: string
   schedule:
     - cron: '0 8 15 * *'
 
@@ -29,53 +13,49 @@ permissions:
   contents: read
 
 jobs:
-  # 🔍 Определяем правильный ref и глубину клонирования
-  resolve-ref:
+  # 🔍 Шаг 1: Автоматический сбор списка целей (все теги или текущий реф)
+  prepare:
     runs-on: ubuntu-latest
     outputs:
-      ref: ${{ steps.resolve.outputs.ref }}
-      fetch-depth: ${{ steps.resolve.outputs.fetch-depth }}
-    steps:
-      - id: resolve
-        run: |
-          EVENT="${{ github.event_name }}"
-          if [[ "$EVENT" == "workflow_dispatch" ]]; then
-            TARGET="${{ inputs.scan-target }}"
-            CUSTOM="${{ inputs.custom-ref }}"
-            
-            if [[ "$TARGET" == "custom" && -n "$CUSTOM" ]]; then
-              REF="$CUSTOM"
-            else
-              REF="$TARGET"
-            fi
-            
-            # Автоматически преобразуем семантические версии в полный путь тега
-            if [[ "$REF" =~ ^[vV]?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "ref=refs/tags/$REF" >> $GITHUB_OUTPUT
-            else
-              echo "ref=$REF" >> $GITHUB_OUTPUT
-            fi
-            # Для ручного запуска всегда берём полную историю, чтобы теги разрешались корректно
-            echo "fetch-depth=0" >> $GITHUB_OUTPUT
-          elif [[ "$EVENT" == "pull_request" ]]; then
-            echo "ref=${{ github.event.pull_request.head.sha }}" >> $GITHUB_OUTPUT
-            echo "fetch-depth=1" >> $GITHUB_OUTPUT
-          else
-            # push или schedule
-            echo "ref=${{ github.ref }}" >> $GITHUB_OUTPUT
-            echo "fetch-depth=1" >> $GITHUB_OUTPUT
-          fi
-
-  check-frontend-cves:
-    needs: resolve-ref
-    runs-on: ubuntu-latest
-
+      targets: ${{ steps.set-targets.outputs.targets }}
     steps:
       - uses: actions/checkout@1e31de5234b9f8995739874a8ce0492dc87873e2 # v4.0.0
         with:
-          token: ${{ github.token }}
-          ref: ${{ needs.resolve-ref.outputs.ref }}
-          fetch-depth: ${{ needs.resolve-ref.outputs.fetch-depth }}
+          fetch-depth: 0
+
+      - id: set-targets
+        run: |
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # Ищем все теги, соответствующие семантическому версионированию (1.5.0, v1.4.2 и т.д.)
+            TAGS=$(git tag -l --sort=-v:refname | grep -E '^[v]?[0-9]+\.[0-9]+\.[0-9]+$')
+            if [[ -z "$TAGS" ]]; then
+              echo "targets=[\"main\"]" >> $GITHUB_OUTPUT
+            else
+              # Формируем JSON массив без внешних зависимостей: ["1.5.0","1.4.2",...]
+              JSON_ARR=$(echo "$TAGS" | sed 's/.*/"&"/' | paste -sd ',' -)
+              echo "targets=[${JSON_ARR}]" >> $GITHUB_OUTPUT
+            fi
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "targets=[\"${{ github.event.pull_request.head.sha }}\"]" >> $GITHUB_OUTPUT
+          else
+            echo "targets=[\"${{ github.ref_name }}\"]" >> $GITHUB_OUTPUT
+          fi
+
+  # 🛡️ Шаг 2: Матричная проверка каждой цели
+  check-cves:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # Проверяем все теги, даже если один упал
+      matrix:
+        target: ${{ fromJson(needs.prepare.outputs.targets) }}
+
+    steps:
+      - name: Checkout ${{ matrix.target }}
+        uses: actions/checkout@1e31de5234b9f8995739874a8ce0492dc87873e2 # v4.0.0
+        with:
+          ref: ${{ matrix.target }}
+          fetch-depth: 0
           fetch-tags: true
 
       - name: Run frontend dependency CVE checks
@@ -87,18 +67,6 @@ jobs:
           format: "table"
           exit-code: "1"
 
-  check-docker-cves:
-    needs: resolve-ref
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@1e31de5234b9f8995739874a8ce0492dc87873e2 # v4.0.0
-        with:
-          token: ${{ github.token }}
-          ref: ${{ needs.resolve-ref.outputs.ref }}
-          fetch-depth: ${{ needs.resolve-ref.outputs.fetch-depth }}
-          fetch-tags: true
-
       - name: Set up JDK
         uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4
         with:
@@ -107,13 +75,12 @@ jobs:
           cache: 'gradle'
 
       - name: Build project
-        id: build
         run: |
           ./gradlew clean build \
           -x test \
           -Pbuild-docker-images=true \
           -Pinclude-frontend=true \
-          -Pversion=latest
+          -Pversion=${{ matrix.target }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.7.0
@@ -125,7 +92,7 @@ jobs:
         uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.3.0
         with:
           path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          key: ${{ runner.os }}-buildx-${{ matrix.target }}
           restore-keys: |
             ${{ runner.os }}-buildx-
 
@@ -137,25 +104,26 @@ jobs:
           push: false
           load: true
           tags: |
-            ghcr.io/kafbat/kafka-ui:latest
+            ghcr.io/kafbat/kafka-ui:${{ matrix.target }}
           build-args: |
-            JAR_FILE=build/libs/api-latest.jar
+            JAR_FILE=build/libs/api-${{ matrix.target }}.jar
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache
 
       - name: Run Docker image CVE checks
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
         with:
-          image-ref: "ghcr.io/kafbat/kafka-ui:latest"
+          image-ref: "ghcr.io/kafbat/kafka-ui:${{ matrix.target }}"
           severity: "CRITICAL,HIGH"
           format: "table"
           exit-code: "1"
 
+  # 📢 Шаг 3: Уведомление (только для расписания)
   notify:
-    needs: [ check-frontend-cves, check-docker-cves ]
-    if: ${{ always() && (needs.check-frontend-cves.result == 'failure' || needs.check-docker-cves.result == 'failure') && github.event_name == 'schedule' }}
+    needs: check-cves
+    if: ${{ always() && needs.check-cves.result == 'failure' && github.event_name == 'schedule' }}
     uses: ./.github/workflows/infra_discord_hook.yml
     with:
-      message: "⚠️ Scheduled CVE checks failed for ${{ needs.resolve-ref.outputs.ref }}! Please fix."
+      message: "⚠️ Scheduled CVE checks failed! Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
     secrets:
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL_CVE }}
