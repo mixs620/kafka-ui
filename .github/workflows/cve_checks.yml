@@ -89,11 +89,17 @@ jobs:
           key: grype-db-${{ runner.os }}-v5
           restore-keys: grype-db-${{ runner.os }}-
 
-      - name: Install Grype
+      - name: Install Grype CLI
         run: curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
 
+      # 🔍 Сканирование Frontend
       - name: Scan Frontend Dependencies
-        run: grype dir:frontend --output json > grype-front.json 2>/dev/null || true
+        run: |
+          grype dir:frontend \
+            --scope all-layers \
+            --add-cpes-if-none \
+            --fail-on none \
+            --output json > grype-front.json 2>/dev/null || true
 
       - name: Set up JDK
         uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4
@@ -140,10 +146,16 @@ jobs:
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache
 
+      # 🔍 Сканирование Docker-образа
       - name: Scan Docker Image
-        run: grype docker:ghcr.io/kafbat/kafka-ui:${{ matrix.target }} --output json > grype-docker.json 2>/dev/null || true
+        run: |
+          grype docker:ghcr.io/kafbat/kafka-ui:${{ matrix.target }} \
+            --scope all-layers \
+            --add-cpes-if-none \
+            --fail-on none \
+            --output json > grype-docker.json 2>/dev/null || true
 
-      # 📊 Финальный отчёт: CVE-формат, сортировка по критичности, столбец описания
+      # 📊 Финальный отчёт: CVE-формат, сортировка Critical → High, столбец описания
       - name: 📊 CVE Summary & Exit Status
         if: always()
         run: |
@@ -154,32 +166,32 @@ jobs:
           FRONTEND="grype-front.json"
           DOCKER="grype-docker.json"
 
-          # Парсинг, резолв GHSA->CVE, нормализация и подготовка к сортировке
+          # Парсинг, резолв GHSA->CVE, нормализация, сортировка
           parse_json() {
-            if [ -f "$1" ]; then
+            if [ -f "$1" ] && [ -s "$1" ]; then
               jq -r '
-                .matches[] |
-                select(.vulnerability.severity == "Critical" or .vulnerability.severity == "High") |
+                .matches[]? |
+                select((.vulnerability.severity | ascii_downcase) == "critical" or (.vulnerability.severity | ascii_downcase) == "high") |
                 {
                   main_id: (.vulnerability.id // ""),
-                  related_ids: [.vulnerability.relatedVulnerabilities[]?.id // ""] | map(select(. != "")),
-                  severity: .vulnerability.severity,
-                  pkg: "\(.artifact.name):\(.artifact.version)",
-                  fix: (((.vulnerability.fix.versions // [])[0]) // "N/A"),
+                  related_ids: [.vulnerability.relatedVulnerabilities[]?.id // ""],
+                  severity: (.vulnerability.severity | ascii_upcase),
+                  pkg: "\(.artifact.name // "unknown"):\(.artifact.version // "unknown")",
+                  fix: (((.vulnerability.fix // {}).versions // [])[0] // "N/A"),
                   desc: (.vulnerability.description // "No description available")
                 } |
-                # Резолв в CVE: ищем CVE в связанных или берём основной
-                ((.related_ids + [.main_id]) | map(select(startswith("CVE-"))) | .[0] // .main_id) as $cve |
-                # Ранг для сортировки: 1=Critical, 2=High
+                # Ищем первый CVE в связанных, иначе оставляем основной
+                ((.related_ids + [.main_id]) | map(select(startswith("CVE-"))) | .[0] // .main_id) as $cve_id |
+                # Ранг: 1=Critical, 2=High (для сортировки)
                 (if .severity == "Critical" then 1 elif .severity == "High" then 2 else 3 end) as $rank |
-                # Очистка и обрезка описания
+                # Очистка описания
                 .desc = (.desc | gsub("[\n\r\t]"; " ") | gsub("  +"; " ") | .[0:65] + (if (.desc | length) > 65 then "..." else "" end)) |
-                "\($rank)|\($cve)|\(.severity)|\(.pkg)|\(.fix)|\(.desc)"
+                "\($rank)|\($cve_id)|\(.severity)|\(.pkg)|\(.fix)|\(.desc)"
               ' "$1" 2>/dev/null
             fi
           }
 
-          # Объединяем, сортируем (Critical → High, затем по CVE), убираем дубли
+          # Объединяем, сортируем, убираем дубли
           { parse_json "$FRONTEND"; parse_json "$DOCKER"; } | \
             sort -t'|' -k1,1n -k2,2 | \
             uniq | \
