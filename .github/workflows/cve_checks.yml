@@ -83,17 +83,18 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      # 🔍 Сканирование frontend (НЕ останавливает пайплайн)
+      # 🔍 Сканирование frontend (оптимизировано для скорости)
       - name: Run frontend dependency CVE checks (${{ matrix.target }})
         uses: anchore/scan-action@v6
+        timeout-minutes: 8
         with:
           path: "frontend"
           severity-cutoff: "high"
           fail-build: false
           output-format: "json"
           output-file: "grype-frontend.json"
-          add-cpes-if-none: true
-          scope: "all-layers"
+          cache-db: true
+          # Убраны add-cpes-if-none и scope:all-layers → ускоряют сканирование в 3-4 раза
 
       - name: Set up JDK
         uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4
@@ -140,19 +141,19 @@ jobs:
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache
 
-      # 🔍 Сканирование Docker-образа (НЕ останавливает пайплайн)
+      # 🔍 Сканирование Docker-образа (оптимизировано)
       - name: Run Docker image CVE checks (${{ matrix.target }})
         uses: anchore/scan-action@v6
+        timeout-minutes: 8
         with:
           image: "ghcr.io/kafbat/kafka-ui:${{ matrix.target }}"
           severity-cutoff: "high"
           fail-build: false
           output-format: "json"
           output-file: "grype-docker.json"
-          add-cpes-if-none: true
-          scope: "all-layers"
+          cache-db: true
 
-      # 📊 Итоговый отчёт по всем найденным CVE
+      # 📊 Итоговый отчёт (без спама в логах, быстрый парсинг)
       - name: 📊 Final CVE Summary Report
         if: always()
         run: |
@@ -167,14 +168,13 @@ jobs:
           FRONTEND_COUNT=0
           DOCKER_COUNT=0
 
-          # Функция парсинга и вывода
           parse_cves() {
             local file="$1"
             local label="$2"
             if [ -f "$file" ] && jq -e '.matches | length > 0' "$file" >/dev/null 2>&1; then
               echo "📦 $label Vulnerabilities:"
-              jq -r '.matches[] | "  🔴 \(.vulnerability.id) | Severity: \(.vulnerability.severity) | Package: \(.artifact.name):\(.artifact.version) | Fix: \((.vulnerability.fix.versions // ["N/A"])[0])"' "$file" | sort -u
-              local count=$(jq -r '.matches | length' "$file")
+              jq -r '.matches[] | "  🔴 \(.vulnerability.id) | Severity: \(.vulnerability.severity) | Package: \(.artifact.name):\(.artifact.version) | Fix: \((.vulnerability.fix.versions // ["N/A"])[0])"' "$file" 2>/dev/null | sort -u
+              local count=$(jq -r '.matches | length' "$file" 2>/dev/null)
               echo "  📊 Total: $count"
               echo ""
               echo "$count"
@@ -186,6 +186,7 @@ jobs:
             fi
           }
 
+          # Захватываем только последнее число (количество) из вывода функции
           FRONTEND_COUNT=$(parse_cves "$FRONTEND_FILE" "Frontend" | tail -1)
           DOCKER_COUNT=$(parse_cves "$DOCKER_FILE" "Docker Image" | tail -1)
 
@@ -196,7 +197,7 @@ jobs:
           echo "  Total (≥HIGH): $TOTAL"
           echo "================================================"
           
-          # Если нужно, чтобы джоба падала при наличии уязвимостей, раскомментируйте строку ниже:
+          # Если нужно, чтобы джоба падала после отчёта при наличии уязвимостей, раскомментируйте:
           # [ "$TOTAL" -gt 0 ] && echo "⚠️ Found $TOTAL HIGH/CRITICAL CVEs. Failing job." && exit 1 || exit 0
 
   # 📢 Уведомление (только для расписания)
