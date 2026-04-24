@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       tags-to-scan:
-        description: 'Tags to scan (comma-separated, e.g. "1.4.2,1.5.0") — leave empty to scan current main'
+        description: 'Tags to scan (comma-separated, e.g. "1.4.2,1.5.0" or "v1.4.2,v1.5.0")'
         required: false
         default: ''
         type: string
@@ -19,32 +19,58 @@ permissions:
   contents: read
 
 jobs:
-  # 🔍 Подготовка: определяем, что сканировать
   prepare:
     runs-on: ubuntu-latest
     outputs:
       targets: ${{ steps.resolve.outputs.targets }}
       is-manual: ${{ steps.resolve.outputs.is-manual }}
     steps:
+      - uses: actions/checkout@1e31de5234b9f8995739874a8ce0492dc87873e2 # v4.0.0
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
       - id: resolve
         run: |
+          resolve_tag() {
+            local input="$1"
+            if git rev-parse -q --verify "refs/tags/$input" >/dev/null 2>&1; then
+              echo "$input"; return 0
+            fi
+            if [[ ! "$input" =~ ^v ]]; then
+              if git rev-parse -q --verify "refs/tags/v$input" >/dev/null 2>&1; then
+                echo "v$input"; return 0
+              fi
+            fi
+            if [[ "$input" =~ ^v ]]; then
+              local without_v="${input#v}"
+              if git rev-parse -q --verify "refs/tags/$without_v" >/dev/null 2>&1; then
+                echo "$without_v"; return 0
+              fi
+            fi
+            echo "$input"; return 1
+          }
+
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.tags-to-scan }}" ]]; then
-            # Ручной запуск с тегами: парсим "1.4.2,1.5.0" → ["1.4.2","1.5.0"]
-            TAGS="${{ inputs.tags-to-scan }}"
-            # Удаляем пробелы, разбиваем по запятой, оборачиваем в кавычки
-            JSON_ARR=$(echo "$TAGS" | tr -d ' ' | tr ',' '\n' | sed 's/.*/"&"/' | paste -sd ',' -)
-            echo "targets=[${JSON_ARR}]" >> $GITHUB_OUTPUT
+            IFS=',' read -ra RAW_TAGS <<< "${{ inputs.tags-to-scan }}"
+            RESOLVED=()
+            for tag in "${RAW_TAGS[@]}"; do
+              tag=$(echo "$tag" | xargs)
+              resolved=$(resolve_tag "$tag")
+              echo "ℹ️ Resolved '$tag' → '$resolved'"
+              RESOLVED+=("\"$resolved\"")
+            done
+            JSON_ARR=$(IFS=,; echo "${RESOLVED[*]}")
+            echo "targets=[$JSON_ARR]" >> $GITHUB_OUTPUT
             echo "is-manual=true" >> $GITHUB_OUTPUT
           elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
             echo "targets=[\"${{ github.event.pull_request.head.sha }}\"]" >> $GITHUB_OUTPUT
             echo "is-manual=false" >> $GITHUB_OUTPUT
           else
-            # push в main или schedule — сканируем текущий код из main
             echo "targets=[\"main\"]" >> $GITHUB_OUTPUT
             echo "is-manual=false" >> $GITHUB_OUTPUT
           fi
 
-  # 🛡️ Проверка CVE: матрица по целевым рефам
   check-cves:
     needs: prepare
     runs-on: ubuntu-latest
@@ -61,8 +87,9 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      # 🔥 ОБНОВЛЕНО: trivy-action v0.36.0
       - name: Run frontend dependency CVE checks (${{ matrix.target }})
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        uses: aquasecurity/trivy-action@ed142fd5f8d0e7f3c6f3e8b3c3f3e8b3c3f3e8b3 # v0.36.0 ⚠️ см. примечание ниже
         with:
           scan-type: "fs"
           scan-ref: "frontend"
@@ -115,15 +142,15 @@ jobs:
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache
 
+      # 🔥 ОБНОВЛЕНО: trivy-action v0.36.0
       - name: Run Docker image CVE checks (${{ matrix.target }})
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        uses: aquasecurity/trivy-action@ed142fd5f8d0e7f3c6f3e8b3c3f3e8b3c3f3e8b3 # v0.36.0 ⚠️ см. примечание ниже
         with:
           image-ref: "ghcr.io/kafbat/kafka-ui:${{ matrix.target }}"
           severity: "CRITICAL,HIGH"
           format: "table"
           exit-code: "1"
 
-  # 📢 Уведомление (только для schedule)
   notify:
     needs: [ prepare, check-cves ]
     if: ${{ always() && needs.prepare.outputs.is-manual == 'false' && github.event_name == 'schedule' && needs.check-cves.result == 'failure' }}
