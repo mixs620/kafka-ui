@@ -6,6 +6,12 @@ on:
   push:
     branches: [ "main" ]
   workflow_dispatch:
+    inputs:
+      tags-to-scan:
+        description: 'Tags to scan (comma-separated, e.g. "1.4.2,1.5.0") — leave empty to scan current main'
+        required: false
+        default: ''
+        type: string
   schedule:
     - cron: '0 8 15 * *'
 
@@ -13,40 +19,37 @@ permissions:
   contents: read
 
 jobs:
-  # 🔍 Шаг 1: Автоматический сбор списка целей (все теги или текущий реф)
+  # 🔍 Подготовка: определяем, что сканировать
   prepare:
     runs-on: ubuntu-latest
     outputs:
-      targets: ${{ steps.set-targets.outputs.targets }}
+      targets: ${{ steps.resolve.outputs.targets }}
+      is-manual: ${{ steps.resolve.outputs.is-manual }}
     steps:
-      - uses: actions/checkout@1e31de5234b9f8995739874a8ce0492dc87873e2 # v4.0.0
-        with:
-          fetch-depth: 0
-
-      - id: set-targets
+      - id: resolve
         run: |
-          if [[ "${{ github.event_name }}" == "schedule" || "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            # Ищем все теги, соответствующие семантическому версионированию (1.5.0, v1.4.2 и т.д.)
-            TAGS=$(git tag -l --sort=-v:refname | grep -E '^[v]?[0-9]+\.[0-9]+\.[0-9]+$')
-            if [[ -z "$TAGS" ]]; then
-              echo "targets=[\"main\"]" >> $GITHUB_OUTPUT
-            else
-              # Формируем JSON массив без внешних зависимостей: ["1.5.0","1.4.2",...]
-              JSON_ARR=$(echo "$TAGS" | sed 's/.*/"&"/' | paste -sd ',' -)
-              echo "targets=[${JSON_ARR}]" >> $GITHUB_OUTPUT
-            fi
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.tags-to-scan }}" ]]; then
+            # Ручной запуск с тегами: парсим "1.4.2,1.5.0" → ["1.4.2","1.5.0"]
+            TAGS="${{ inputs.tags-to-scan }}"
+            # Удаляем пробелы, разбиваем по запятой, оборачиваем в кавычки
+            JSON_ARR=$(echo "$TAGS" | tr -d ' ' | tr ',' '\n' | sed 's/.*/"&"/' | paste -sd ',' -)
+            echo "targets=[${JSON_ARR}]" >> $GITHUB_OUTPUT
+            echo "is-manual=true" >> $GITHUB_OUTPUT
           elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
             echo "targets=[\"${{ github.event.pull_request.head.sha }}\"]" >> $GITHUB_OUTPUT
+            echo "is-manual=false" >> $GITHUB_OUTPUT
           else
-            echo "targets=[\"${{ github.ref_name }}\"]" >> $GITHUB_OUTPUT
+            # push в main или schedule — сканируем текущий код из main
+            echo "targets=[\"main\"]" >> $GITHUB_OUTPUT
+            echo "is-manual=false" >> $GITHUB_OUTPUT
           fi
 
-  # 🛡️ Шаг 2: Матричная проверка каждой цели
+  # 🛡️ Проверка CVE: матрица по целевым рефам
   check-cves:
     needs: prepare
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false # Проверяем все теги, даже если один упал
+      fail-fast: false
       matrix:
         target: ${{ fromJson(needs.prepare.outputs.targets) }}
 
@@ -58,7 +61,7 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Run frontend dependency CVE checks
+      - name: Run frontend dependency CVE checks (${{ matrix.target }})
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
         with:
           scan-type: "fs"
@@ -74,7 +77,8 @@ jobs:
           distribution: 'zulu'
           cache: 'gradle'
 
-      - name: Build project
+      - name: Build project (${{ matrix.target }})
+        id: build
         run: |
           ./gradlew clean build \
           -x test \
@@ -96,9 +100,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-buildx-
 
-      - name: Build docker image
+      - name: Build docker image (${{ matrix.target }})
         uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4 # v6.18.0
         with:
+          builder: ${{ steps.buildx.outputs.name }}
           context: api
           platforms: linux/amd64
           push: false
@@ -110,7 +115,7 @@ jobs:
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache
 
-      - name: Run Docker image CVE checks
+      - name: Run Docker image CVE checks (${{ matrix.target }})
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
         with:
           image-ref: "ghcr.io/kafbat/kafka-ui:${{ matrix.target }}"
@@ -118,10 +123,10 @@ jobs:
           format: "table"
           exit-code: "1"
 
-  # 📢 Шаг 3: Уведомление (только для расписания)
+  # 📢 Уведомление (только для schedule)
   notify:
-    needs: check-cves
-    if: ${{ always() && needs.check-cves.result == 'failure' && github.event_name == 'schedule' }}
+    needs: [ prepare, check-cves ]
+    if: ${{ always() && needs.prepare.outputs.is-manual == 'false' && github.event_name == 'schedule' && needs.check-cves.result == 'failure' }}
     uses: ./.github/workflows/infra_discord_hook.yml
     with:
       message: "⚠️ Scheduled CVE checks failed! Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
