@@ -19,18 +19,16 @@ permissions:
   contents: read
 
 jobs:
-  # 🔍 Автоматическое разрешение тегов
   prepare:
     runs-on: ubuntu-latest
     outputs:
       targets: ${{ steps.resolve.outputs.targets }}
       is-manual: ${{ steps.resolve.outputs.is-manual }}
     steps:
-      - uses: actions/checkout@1e31de5234b9f8995739874a8ce0492dc87873e2 # v4.0.0
+      - uses: actions/checkout@1e31de5234b9f8995739874a8ce0492dc87873e2
         with:
           fetch-depth: 0
           fetch-tags: true
-
       - id: resolve
         run: |
           resolve_tag() {
@@ -45,18 +43,15 @@ jobs:
             fi
             echo "$input"; return 1
           }
-
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.tags-to-scan }}" ]]; then
             IFS=',' read -ra RAW_TAGS <<< "${{ inputs.tags-to-scan }}"
             RESOLVED=()
             for tag in "${RAW_TAGS[@]}"; do
               tag=$(echo "$tag" | xargs)
               resolved=$(resolve_tag "$tag")
-              echo "ℹ️ Resolved '$tag' → '$resolved'"
               RESOLVED+=("\"$resolved\"")
             done
-            JSON_ARR=$(IFS=,; echo "${RESOLVED[*]}")
-            echo "targets=[$JSON_ARR]" >> $GITHUB_OUTPUT
+            echo "targets=[$(IFS=,; echo "${RESOLVED[*]}")]" >> $GITHUB_OUTPUT
             echo "is-manual=true" >> $GITHUB_OUTPUT
           elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
             echo "targets=[\"${{ github.event.pull_request.head.sha }}\"]" >> $GITHUB_OUTPUT
@@ -66,7 +61,6 @@ jobs:
             echo "is-manual=false" >> $GITHUB_OUTPUT
           fi
 
-  # 🛡️ Быстрая матричная проверка уязвимостей
   check-cves:
     needs: prepare
     runs-on: ubuntu-latest
@@ -75,81 +69,60 @@ jobs:
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.prepare.outputs.targets) }}
-
     steps:
       - name: Checkout ${{ matrix.target }}
-        uses: actions/checkout@1e31de5234b9f8995739874a8ce0492dc87873e2 # v4.0.0
+        uses: actions/checkout@1e31de5234b9f8995739874a8ce0492dc87873e2
         with:
           ref: ${{ matrix.target }}
           fetch-depth: 0
           fetch-tags: true
-
-      # ⚡ Кеш базы уязвимостей Grype (ускоряет запуск на 15-30 сек)
       - name: Cache Grype DB
-        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.3.0
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf
         with:
           path: ~/.cache/grype/db
           key: grype-db-${{ runner.os }}-v5
           restore-keys: grype-db-${{ runner.os }}-
-
-      # ⚡ Установка Grype CLI напрямую (без тяжёлых экшенов)
       - name: Install Grype
         run: curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
-
-      # 🔍 Сканирование Frontend (быстро, не прерывает пайплайн)
       - name: Scan Frontend Dependencies
         run: grype dir:frontend --output json > grype-front.json 2>/dev/null || true
-
       - name: Set up JDK
-        uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4
+        uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12
         with:
           java-version-file: '.java-version'
           distribution: 'zulu'
           cache: 'gradle'
-
       - name: Build project (${{ matrix.target }})
         id: build
         run: |
-          ./gradlew clean build \
-          -x test \
-          -Pbuild-docker-images=true \
-          -Pinclude-frontend=true \
-          -Pversion=${{ matrix.target }}
-
+          ./gradlew clean build -x test -Pbuild-docker-images=true -Pinclude-frontend=true -Pversion=${{ matrix.target }}
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.7.0
-
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.11.1
-
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2
       - name: Cache Docker layers
-        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.3.0
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf
         with:
           path: /tmp/.buildx-cache
           key: ${{ runner.os }}-buildx-${{ matrix.target }}
           restore-keys: |
             ${{ runner.os }}-buildx-
-
       - name: Build docker image (${{ matrix.target }})
-        uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4 # v6.18.0
+        uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4
         with:
           builder: ${{ steps.buildx.outputs.name }}
           context: api
           platforms: linux/amd64
           push: false
           load: true
-          tags: |
-            ghcr.io/kafbat/kafka-ui:${{ matrix.target }}
-          build-args: |
-            JAR_FILE=build/libs/api-${{ matrix.target }}.jar
+          tags: ghcr.io/kafbat/kafka-ui:${{ matrix.target }}
+          build-args: JAR_FILE=build/libs/api-${{ matrix.target }}.jar
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache
-
-      # 🔍 Сканирование Docker-образа (быстро, не прерывает пайплайн)
       - name: Scan Docker Image
         run: grype docker:ghcr.io/kafbat/kafka-ui:${{ matrix.target }} --output json > grype-docker.json 2>/dev/null || true
 
-      # 📊 Финальный отчёт + чёткий статус
+      # 📊 Финальный отчёт — УПРОЩЁННАЯ конвертация GHSA→CVE
       - name: 📊 CVE Summary & Exit Status
         if: always()
         run: |
@@ -160,21 +133,24 @@ jobs:
           FRONTEND="grype-front.json"
           DOCKER="grype-docker.json"
 
-          # Извлекаем только HIGH и CRITICAL, дедуплицируем
-          # 🔧 ЕДИНСТВЕННОЕ ИЗМЕНЕНИЕ: конвертация GHSA- → CVE-
           parse_json() {
-            if [ -f "$1" ]; then
+            if [ -f "$1" ] && [ -s "$1" ]; then
               jq -r '
                 .matches[]? |
                 select(.vulnerability.severity == "High" or .vulnerability.severity == "Critical") |
-                # Если ID начинается с GHSA, пытаемся найти CVE в relatedVulnerabilities
+                # Сохраняем оригинальный ID
+                .vulnerability.id as $orig |
+                # Простая конвертация: если начинается с GHSA — ищем первый CVE в related
                 (
-                  if (.vulnerability.id | startswith("GHSA")) then
-                    ((.vulnerability.relatedVulnerabilities // []) | map(.id // "") | map(select(startswith("CVE-"))) | .[0] // .vulnerability.id)
-                  else .vulnerability.id end
-                ) as $cve_id |
-                "\($cve_id)|\(.vulnerability.severity)|\(.artifact.name):\(.artifact.version)|\((.vulnerability.fix.versions // ["N/A"])[0])"
-              ' "$1" 2>/dev/null
+                  if ($orig // "") | startswith("GHSA") then
+                    (
+                      [.vulnerability.relatedVulnerabilities // [] | .[] | .id // "" | select(startswith("CVE"))] |
+                      if length > 0 then .[0] else $orig end
+                    )
+                  else $orig end
+                ) as $cve |
+                "\($cve)|\(.vulnerability.severity)|\(.artifact.name):\(.artifact.version)|\((.vulnerability.fix.versions // ["N/A"])[0])"
+              ' "$1"
             fi
           }
 
@@ -196,7 +172,6 @@ jobs:
             exit 0
           fi
 
-  # 📢 Уведомление (только для расписания)
   notify:
     needs: [ prepare, check-cves ]
     if: ${{ always() && needs.prepare.outputs.is-manual == 'false' && github.event_name == 'schedule' && needs.check-cves.result == 'failure' }}
