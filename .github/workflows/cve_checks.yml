@@ -19,6 +19,7 @@ permissions:
   contents: read
 
 jobs:
+  # 🔍 Автоматическое разрешение тегов
   prepare:
     runs-on: ubuntu-latest
     outputs:
@@ -34,19 +35,13 @@ jobs:
         run: |
           resolve_tag() {
             local input="$1"
-            if git rev-parse -q --verify "refs/tags/$input" >/dev/null 2>&1; then
-              echo "$input"; return 0
-            fi
+            if git rev-parse -q --verify "refs/tags/$input" >/dev/null 2>&1; then echo "$input"; return 0; fi
             if [[ ! "$input" =~ ^v ]]; then
-              if git rev-parse -q --verify "refs/tags/v$input" >/dev/null 2>&1; then
-                echo "v$input"; return 0
-              fi
+              if git rev-parse -q --verify "refs/tags/v$input" >/dev/null 2>&1; then echo "v$input"; return 0; fi
             fi
             if [[ "$input" =~ ^v ]]; then
               local without_v="${input#v}"
-              if git rev-parse -q --verify "refs/tags/$without_v" >/dev/null 2>&1; then
-                echo "$without_v"; return 0
-              fi
+              if git rev-parse -q --verify "refs/tags/$without_v" >/dev/null 2>&1; then echo "$without_v"; return 0; fi
             fi
             echo "$input"; return 1
           }
@@ -71,6 +66,7 @@ jobs:
             echo "is-manual=false" >> $GITHUB_OUTPUT
           fi
 
+  # 🛡️ Матричная проверка уязвимостей
   check-cves:
     needs: prepare
     runs-on: ubuntu-latest
@@ -87,15 +83,16 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      # ✅ ОБНОВЛЕНО: используем стабильный тег. Для пиннинга по SHA см. инструкцию ниже
+      # 🔥 GRYPE: Сканирование frontend-зависимостей
       - name: Run frontend dependency CVE checks (${{ matrix.target }})
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        uses: anchore/scan-action@v6
         with:
-          scan-type: "fs"
-          scan-ref: "frontend"
-          severity: "CRITICAL,HIGH"
-          format: "table"
-          exit-code: "1"
+          path: "frontend"
+          severity-cutoff: "high"
+          fail-build: true
+          output-format: "table"
+          add-cpes-if-none: true
+          scope: "all-layers"
 
       - name: Set up JDK
         uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4
@@ -142,15 +139,18 @@ jobs:
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache
 
-      # ✅ ОБНОВЛЕНО
+      # 🔥 GRYPE: Сканирование Docker-образа
       - name: Run Docker image CVE checks (${{ matrix.target }})
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        uses: anchore/scan-action@v6
         with:
-          image-ref: "ghcr.io/kafbat/kafka-ui:${{ matrix.target }}"
-          severity: "CRITICAL,HIGH"
-          format: "table"
-          exit-code: "1"
+          image: "ghcr.io/kafbat/kafka-ui:${{ matrix.target }}"
+          severity-cutoff: "high"
+          fail-build: true
+          output-format: "table"
+          add-cpes-if-none: true
+          scope: "all-layers"
 
+  # 📢 Уведомление (только для расписания)
   notify:
     needs: [ prepare, check-cves ]
     if: ${{ always() && needs.prepare.outputs.is-manual == 'false' && github.event_name == 'schedule' && needs.check-cves.result == 'failure' }}
