@@ -87,9 +87,9 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      # 🔥 ОБНОВЛЕНО: trivy-action v0.36.0
+      # ✅ ОБНОВЛЕНО: используем стабильный тег. Для пиннинга по SHA см. инструкцию ниже
       - name: Run frontend dependency CVE checks (${{ matrix.target }})
-        uses: aquasecurity/trivy-action@ed142fd5f8d0e7f3c6f3e8b3c3f3e8b3c3f3e8b3 # v0.36.0 ⚠️ см. примечание ниже
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: "fs"
           scan-ref: "frontend"
@@ -142,9 +142,9 @@ jobs:
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache
 
-      # 🔥 ОБНОВЛЕНО: trivy-action v0.36.0
+      # ✅ ОБНОВЛЕНО
       - name: Run Docker image CVE checks (${{ matrix.target }})
-        uses: aquasecurity/trivy-action@ed142fd5f8d0e7f3c6f3e8b3c3f3e8b3c3f3e8b3 # v0.36.0 ⚠️ см. примечание ниже
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: "ghcr.io/kafbat/kafka-ui:${{ matrix.target }}"
           severity: "CRITICAL,HIGH"
