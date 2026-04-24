@@ -90,17 +90,14 @@ jobs:
           restore-keys: grype-db-${{ runner.os }}-
 
       - name: Install Grype CLI
-        run: curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin v0.81.0
+        run: curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin v0.82.3
 
-      # 🔍 Сканирование Frontend
       - name: Scan Frontend Dependencies
         run: |
           set +e
           grype dir:frontend --scope all-layers --add-cpes-if-none --output json > grype-front.json
-          SCAN_EXIT=$?
+          echo "Grype frontend exit: $?"
           set -e
-          echo "Grype frontend exit code: $SCAN_EXIT"
-          ls -lh grype-front.json
 
       - name: Set up JDK
         uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4
@@ -147,17 +144,14 @@ jobs:
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache
 
-      # 🔍 Сканирование Docker-образа
       - name: Scan Docker Image
         run: |
           set +e
           grype docker:ghcr.io/kafbat/kafka-ui:${{ matrix.target }} --scope all-layers --add-cpes-if-none --output json > grype-docker.json
-          SCAN_EXIT=$?
+          echo "Grype docker exit: $?"
           set -e
-          echo "Grype docker exit code: $SCAN_EXIT"
-          ls -lh grype-docker.json
 
-      # 📊 Финальный отчёт + безопасный парсинг
+      # 📊 Финальный отчёт: устойчивый парсинг, сортировка Critical → High, CVE-формат
       - name: 📊 CVE Summary & Exit Status
         if: always()
         run: |
@@ -168,69 +162,47 @@ jobs:
           FRONTEND="grype-front.json"
           DOCKER="grype-docker.json"
 
-          # Функция безопасного парсинга
-          parse_json() {
+          parse_grype() {
             local file="$1"
-            if [ ! -f "$file" ] || [ ! -s "$file" ]; then
-              echo "⚠️ $file is empty or missing" >&2
-              return
-            fi
-            # Проверяем валидность JSON
-            if ! jq empty "$file" 2>/dev/null; then
-              echo "⚠️ $file contains invalid JSON" >&2
-              head -5 "$file" >&2
-              return
-            fi
-            # Извлекаем уязвимости
+            if [ ! -f "$file" ] || [ ! -s "$file" ]; then return; fi
+            # Проверяем валидность JSON перед парсингом
+            jq empty "$file" 2>/dev/null || { echo "⚠️ Invalid JSON in $file"; return; }
+            
             jq -r '
               .matches[]? |
-              select(
-                (.vulnerability.severity | ascii_downcase) == "critical" or 
-                (.vulnerability.severity | ascii_downcase) == "high"
-              ) |
+              select(.vulnerability.severity | test("critical|high"; "i")) |
               {
-                main_id: (.vulnerability.id // ""),
-                related_ids: [.vulnerability.relatedVulnerabilities[]?.id // ""] | map(select(. != "")),
+                cve: (([.vulnerability.relatedVulnerabilities[]?.id // ""] + [.vulnerability.id // ""]) | map(select(startswith("CVE-"))) | .[0] // "N/A"),
                 severity: (.vulnerability.severity | ascii_upcase),
                 pkg: "\(.artifact.name // "unknown"):\(.artifact.version // "unknown")",
-                fix: ((.vulnerability.fix.versions // [])[0] // "N/A"),
-                desc: (.vulnerability.description // "No description available")
-              } |
-              # Резолв GHSA -> CVE
-              ((.related_ids + [.main_id]) | map(select(startswith("CVE-"))) | .[0] // .main_id) as $cve_id |
-              # Ранг сортировки
-              (if .severity == "CRITICAL" then 1 elif .severity == "HIGH" then 2 else 3 end) as $rank |
-              # Очистка описания
-              .desc = (.desc | gsub("[\n\r\t]"; " ") | gsub("  +"; " ") | .[0:65] + (if (.desc | length) > 65 then "..." else "" end)) |
-              "\($rank)|\($cve_id)|\(.severity)|\(.pkg)|\(.fix)|\(.desc)"
-            ' "$file" 2>/dev/null
+                fix: (((.vulnerability.fix // {}).versions // [])[0] // "N/A"),
+                desc: ((.vulnerability.description // "No description") | gsub("[\n\r\t]"; " ") | gsub("  +"; " ") | if length > 65 then .[0:65] + "..." else . end),
+                rank: (if (.vulnerability.severity | test("critical"; "i")) then 0 else 1 end)
+              } | "\(.rank)|\(.cve)|\(.severity)|\(.pkg)|\(.fix)|\(.desc)"
+            ' "$file"
           }
 
-          # Объединяем, сортируем, дедуплицируем
-          { parse_json "$FRONTEND"; parse_json "$DOCKER"; } | \
-            sort -t'|' -k1,1n -k2,2 | \
-            uniq | \
-            cut -d'|' -f2- > cves_report.txt
+          { parse_grype "$FRONTEND"; parse_grype "$DOCKER"; } | sort -t'|' -k1,1n -k2,2 | uniq | cut -d'|' -f2- > cves_report.txt
 
           COUNT=$(wc -l < cves_report.txt | tr -d ' ')
 
-          if [ "$COUNT" -eq 0 ]; then
-            echo "ℹ️ Raw matches found in JSON (debug):"
-            jq '.matches | length' "$FRONTEND" "$DOCKER" 2>/dev/null || echo "  (files missing)"
-            jq '.matches[]?.vulnerability.severity' "$FRONTEND" "$DOCKER" 2>/dev/null | head -10 || echo "  (no data)"
+          if [ "$COUNT" -gt 0 ]; then
+            printf "%-22s | %-10s | %-35s | %-12s | %-65s\n" "CVE ID" "Severity" "Package:Version" "Fixed In" "Description"
+            echo "-----------------------|------------|-------------------------------------|-------------|------------------------------------------------------------------"
+            while IFS='|' read -r cve sev pkg fix desc; do
+              printf "%-22s | %-10s | %-35s | %-12s | %-65s\n" "$cve" "$sev" "$pkg" "$fix" "$desc"
+            done < cves_report.txt
             echo ""
+            echo "❌ Found $COUNT HIGH/CRITICAL vulnerabilities."
+            exit 1
+          else
             echo "✅ No HIGH/CRITICAL vulnerabilities detected."
+            echo "ℹ️ Debug info:"
+            echo "  Frontend matches: $(jq '.matches | length' "$FRONTEND" 2>/dev/null || echo '0')"
+            echo "  Docker matches:   $(jq '.matches | length' "$DOCKER" 2>/dev/null || echo '0')"
+            echo "  Severities found: $(jq -r '[.[].vulnerability.severity] | unique | join(", ")' "$FRONTEND" "$DOCKER" 2>/dev/null | head -1)"
             exit 0
           fi
-
-          printf "%-22s | %-10s | %-35s | %-12s | %-65s\n" "CVE ID" "Severity" "Package:Version" "Fixed In" "Description"
-          echo "-----------------------|------------|-------------------------------------|-------------|------------------------------------------------------------------"
-          while IFS='|' read -r cve sev pkg fix desc; do
-            printf "%-22s | %-10s | %-35s | %-12s | %-65s\n" "$cve" "$sev" "$pkg" "$fix" "$desc"
-          done < cves_report.txt
-          echo ""
-          echo "❌ Found $COUNT HIGH/CRITICAL vulnerabilities."
-          exit 1
 
   notify:
     needs: [ prepare, check-cves ]
