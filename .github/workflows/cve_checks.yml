@@ -90,9 +90,22 @@ jobs:
           path: "frontend"
           severity-cutoff: "high"
           fail-build: true
-          output-format: "table"
+          output-format: "json"
+          output-file: "grype-frontend.json"
           add-cpes-if-none: true
           scope: "all-layers"
+          by-cve: true
+
+      # 📋 Явный вывод найденных CVE (Frontend)
+      - name: List found CVEs (Frontend)
+        if: always()
+        run: |
+          if [ -f grype-frontend.json ] && jq -e '.matches | length > 0' grype-frontend.json >/dev/null 2>&1; then
+            echo "🚨 Discovered Vulnerabilities:"
+            jq -r '.matches[] | "  🔴 CVE: \(.vulnerability.id) | Severity: \(.vulnerability.severity) | Package: \(.artifact.name):\(.artifact.version) | Fix: \(.vulnerability.fix.versions[0] // "not available")"' grype-frontend.json | sort -u
+          else
+            echo "✅ No HIGH/CRITICAL CVEs found in frontend."
+          fi
 
       - name: Set up JDK
         uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4
@@ -146,9 +159,22 @@ jobs:
           image: "ghcr.io/kafbat/kafka-ui:${{ matrix.target }}"
           severity-cutoff: "high"
           fail-build: true
-          output-format: "table"
+          output-format: "json"
+          output-file: "grype-docker.json"
           add-cpes-if-none: true
           scope: "all-layers"
+          by-cve: true
+
+      # 📋 Явный вывод найденных CVE (Docker)
+      - name: List found CVEs (Docker)
+        if: always()
+        run: |
+          if [ -f grype-docker.json ] && jq -e '.matches | length > 0' grype-docker.json >/dev/null 2>&1; then
+            echo "🚨 Discovered Vulnerabilities:"
+            jq -r '.matches[] | "  🔴 CVE: \(.vulnerability.id) | Severity: \(.vulnerability.severity) | Package: \(.artifact.name):\(.artifact.version) | Fix: \(.vulnerability.fix.versions[0] // "not available")"' grype-docker.json | sort -u
+          else
+            echo "✅ No HIGH/CRITICAL CVEs found in Docker image."
+          fi
 
   # 📢 Уведомление (только для расписания)
   notify:
