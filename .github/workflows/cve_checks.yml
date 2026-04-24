@@ -161,13 +161,13 @@ jobs:
           DOCKER="grype-docker.json"
 
           # Извлекаем только HIGH и CRITICAL, дедуплицируем
-          # 🔧 ЕДИНСТВЕННОЕ ИЗМЕНЕНИЕ: резолв GHSA → CVE
+          # 🔧 ЕДИНСТВЕННОЕ ИЗМЕНЕНИЕ: конвертация GHSA- → CVE-
           parse_json() {
             if [ -f "$1" ]; then
               jq -r '
                 .matches[]? |
                 select(.vulnerability.severity == "High" or .vulnerability.severity == "Critical") |
-                # Если ID начинается с GHSA, ищем CVE в relatedVulnerabilities
+                # Если ID начинается с GHSA, пытаемся найти CVE в relatedVulnerabilities
                 (
                   if (.vulnerability.id | startswith("GHSA")) then
                     ((.vulnerability.relatedVulnerabilities // []) | map(.id // "") | map(select(startswith("CVE-"))) | .[0] // .vulnerability.id)
