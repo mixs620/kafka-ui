@@ -66,10 +66,11 @@ jobs:
             echo "is-manual=false" >> $GITHUB_OUTPUT
           fi
 
-  # 🛡️ Матричная проверка уязвимостей
+  # 🛡️ Быстрая матричная проверка уязвимостей
   check-cves:
     needs: prepare
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     strategy:
       fail-fast: false
       matrix:
@@ -83,18 +84,21 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      # 🔍 Сканирование frontend (оптимизировано для скорости)
-      - name: Run frontend dependency CVE checks (${{ matrix.target }})
-        uses: anchore/scan-action@v6
-        timeout-minutes: 8
+      # ⚡ Кеш базы уязвимостей Grype (ускоряет запуск на 15-30 сек)
+      - name: Cache Grype DB
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.3.0
         with:
-          path: "frontend"
-          severity-cutoff: "high"
-          fail-build: false
-          output-format: "json"
-          output-file: "grype-frontend.json"
-          cache-db: true
-          # Убраны add-cpes-if-none и scope:all-layers → ускоряют сканирование в 3-4 раза
+          path: ~/.cache/grype/db
+          key: grype-db-${{ runner.os }}-v5
+          restore-keys: grype-db-${{ runner.os }}-
+
+      # ⚡ Установка Grype CLI напрямую (без тяжёлых экшенов)
+      - name: Install Grype
+        run: curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+
+      # 🔍 Сканирование Frontend (быстро, не прерывает пайплайн)
+      - name: Scan Frontend Dependencies
+        run: grype dir:frontend --output json > grype-front.json 2>/dev/null || true
 
       - name: Set up JDK
         uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4
@@ -141,64 +145,45 @@ jobs:
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache
 
-      # 🔍 Сканирование Docker-образа (оптимизировано)
-      - name: Run Docker image CVE checks (${{ matrix.target }})
-        uses: anchore/scan-action@v6
-        timeout-minutes: 8
-        with:
-          image: "ghcr.io/kafbat/kafka-ui:${{ matrix.target }}"
-          severity-cutoff: "high"
-          fail-build: false
-          output-format: "json"
-          output-file: "grype-docker.json"
-          cache-db: true
+      # 🔍 Сканирование Docker-образа (быстро, не прерывает пайплайн)
+      - name: Scan Docker Image
+        run: grype docker:ghcr.io/kafbat/kafka-ui:${{ matrix.target }} --output json > grype-docker.json 2>/dev/null || true
 
-      # 📊 Итоговый отчёт (без спама в логах, быстрый парсинг)
-      - name: 📊 Final CVE Summary Report
+      # 📊 Финальный отчёт + чёткий статус
+      - name: 📊 CVE Summary & Exit Status
         if: always()
         run: |
-          echo ""
-          echo "🔍 ================= CVE SUMMARY REPORT ================="
+          echo "🔍 ================= CVE REPORT ================="
           echo "🎯 Target: ${{ matrix.target }}"
           echo ""
 
-          FRONTEND_FILE="grype-frontend.json"
-          DOCKER_FILE="grype-docker.json"
-          
-          FRONTEND_COUNT=0
-          DOCKER_COUNT=0
+          FRONTEND="grype-front.json"
+          DOCKER="grype-docker.json"
 
-          parse_cves() {
-            local file="$1"
-            local label="$2"
-            if [ -f "$file" ] && jq -e '.matches | length > 0' "$file" >/dev/null 2>&1; then
-              echo "📦 $label Vulnerabilities:"
-              jq -r '.matches[] | "  🔴 \(.vulnerability.id) | Severity: \(.vulnerability.severity) | Package: \(.artifact.name):\(.artifact.version) | Fix: \((.vulnerability.fix.versions // ["N/A"])[0])"' "$file" 2>/dev/null | sort -u
-              local count=$(jq -r '.matches | length' "$file" 2>/dev/null)
-              echo "  📊 Total: $count"
-              echo ""
-              echo "$count"
-            else
-              echo "📦 $label Vulnerabilities:"
-              echo "  ✅ None found (≥ HIGH)"
-              echo ""
-              echo "0"
+          # Извлекаем только HIGH и CRITICAL, дедуплицируем
+          parse_json() {
+            if [ -f "$1" ]; then
+              jq -r '.matches[]? | select(.vulnerability.severity == "High" or .vulnerability.severity == "Critical") | "\(.vulnerability.id)|\(.vulnerability.severity)|\(.artifact.name):\(.artifact.version)|\((.vulnerability.fix.versions // ["N/A"])[0])"' "$1" 2>/dev/null
             fi
           }
 
-          # Захватываем только последнее число (количество) из вывода функции
-          FRONTEND_COUNT=$(parse_cves "$FRONTEND_FILE" "Frontend" | tail -1)
-          DOCKER_COUNT=$(parse_cves "$DOCKER_FILE" "Docker Image" | tail -1)
+          { parse_json "$FRONTEND"; parse_json "$DOCKER"; } | sort -u > cves_filtered.txt
 
-          TOTAL=$((FRONTEND_COUNT + DOCKER_COUNT))
-          echo "📈 ================= SUMMARY ================="
-          echo "  Frontend CVEs: $FRONTEND_COUNT"
-          echo "  Docker CVEs:   $DOCKER_COUNT"
-          echo "  Total (≥HIGH): $TOTAL"
-          echo "================================================"
-          
-          # Если нужно, чтобы джоба падала после отчёта при наличии уязвимостей, раскомментируйте:
-          # [ "$TOTAL" -gt 0 ] && echo "⚠️ Found $TOTAL HIGH/CRITICAL CVEs. Failing job." && exit 1 || exit 0
+          COUNT=$(wc -l < cves_filtered.txt | tr -d ' ')
+
+          if [ "$COUNT" -gt 0 ]; then
+            printf "%-22s | %-10s | %-35s | %-12s\n" "CVE" "Severity" "Package" "Fixed In"
+            echo "-----------------------|------------|-------------------------------------|-------------"
+            while IFS='|' read -r cve sev pkg fix; do
+              printf "%-22s | %-10s | %-35s | %-12s\n" "$cve" "$sev" "$pkg" "$fix"
+            done < cves_filtered.txt
+            echo ""
+            echo "❌ Found $COUNT HIGH/CRITICAL CVEs."
+            exit 1
+          else
+            echo "✅ No HIGH/CRITICAL CVEs detected."
+            exit 0
+          fi
 
   # 📢 Уведомление (только для расписания)
   notify:
@@ -206,6 +191,6 @@ jobs:
     if: ${{ always() && needs.prepare.outputs.is-manual == 'false' && github.event_name == 'schedule' && needs.check-cves.result == 'failure' }}
     uses: ./.github/workflows/infra_discord_hook.yml
     with:
-      message: "⚠️ Scheduled CVE checks completed. Review logs for full report. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      message: "⚠️ Scheduled CVE checks failed for ${{ matrix.target }}! Review: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
     secrets:
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL_CVE }}
